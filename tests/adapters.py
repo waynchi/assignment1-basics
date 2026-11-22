@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
+from cs336_basics.pretokenization_example import find_chunk_boundaries
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+import regex as re
 
 
 def run_linear(
@@ -452,7 +456,9 @@ def run_cross_entropy(
     raise NotImplementedError
 
 
-def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def run_gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter], max_l2_norm: float
+) -> None:
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
 
     Args:
@@ -589,4 +595,160 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    freq_table = {}
+    vocab = [bytes([i]) for i in range(256)]
+    vocab.extend([special_token.encode("utf-8") for special_token in special_tokens])
+    with open(input_path, "rb") as f:
+        num_processes = 4
+        boundaries: list[int] = find_chunk_boundaries(
+            f, num_processes, b"<|endoftext|>", **kwargs
+        )
+        i = 0
+
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+            # Process chunk here.
+            chunks = [chunk]
+            for special_token in special_tokens:
+                new_chunks = []
+                for c in chunks:
+                    new_chunks.extend(c.split(special_token))
+                chunks = new_chunks
+
+            for c in chunks:
+                matches = pretokenize(c)
+
+                # First generate all bytes -> count
+                for m in matches:
+                    token_bytes = m.group().encode("utf-8")
+                    if token_bytes not in freq_table:
+                        freq_table[token_bytes] = 0
+                    freq_table[token_bytes] += 1
+
+            i += 1
+
+    vocab_list, merges = bpe(vocab, freq_table, vocab_size, **kwargs)
+
+    vocab = {}
+    for i in range(len(vocab_list)):
+        vocab[i] = vocab_list[i]
+
+    return vocab, merges
+
+
+@dataclass
+class Node:
+    value: tuple[bytes]
+    freq: int = 0
+    prev: Node = None
+    next: Node = None
+    alive: bool = True
+
+
+def bpe(
+    vocab,
+    freq_table,
+    vocab_size: int,
+    **kwargs,
+):
+    merges = []
+
+    # convet str to tokens
+
+    # Second generate all the combination counts
+    comb_freq_table = {}
+    comb_node_table = {}
+
+    # construct linked list
+    for word in freq_table.keys():
+        prev = None
+        for i in range(len(word) - 1):
+            current = Node((word[i : i + 1], word[i + 1 : i + 2]), freq_table[word])
+            if prev != None:
+                current.prev = prev
+                prev.next = current
+
+            if current.value not in comb_freq_table:
+                comb_freq_table[current.value] = 0
+                comb_node_table[current.value] = []
+
+            comb_freq_table[current.value] += current.freq
+            comb_node_table[current.value].append(current)
+
+            prev = current
+
+    while len(vocab) < vocab_size and comb_freq_table:
+        comb_freq_table = dict(sorted(comb_freq_table.items(), reverse=True))
+        # Third update the vocab
+        # Get max of comb_freq_table
+        max_pair = max(comb_freq_table, key=comb_freq_table.get)
+        combined = max_pair[0] + max_pair[1]
+        vocab.append(combined)
+        merges.append(max_pair)
+
+        # Fourth update the freq table
+        for node in comb_node_table[max_pair]:
+            if not node.alive:
+                continue
+            node.alive = False
+            new_left = None
+
+            if node.prev is not None:
+                # new_node will be a combo of the preiovus node's first value + current nodes double value
+                new_node = Node((node.prev.value[0], combined), node.freq)
+                node.prev.alive = False
+                new_left = new_node
+                new_node.prev = node.prev.prev
+                if node.prev.prev is not None:
+                    node.prev.prev.next = new_node
+
+                if new_node.value not in comb_freq_table:
+                    comb_freq_table[new_node.value] = 0
+                    comb_node_table[new_node.value] = []
+
+                comb_freq_table[new_node.value] += new_node.freq
+                comb_node_table[new_node.value].append(new_node)
+
+                comb_freq_table[node.prev.value] -= node.prev.freq
+                if comb_freq_table[node.prev.value] <= 0:
+                    comb_freq_table.pop(node.prev.value)
+                    comb_node_table.pop(node.prev.value)
+
+            if node.next is not None:
+                node.next.alive = False
+                # new_node will be a combo of the preiovus node's first value + current nodes double value
+                new_node = Node((combined, node.next.value[1]), node.freq)
+                new_node.next = node.next.next
+                if node.next.next is not None:
+                    node.next.next.prev = new_node
+                new_node.prev = new_left
+                if new_left is not None:
+                    new_left.next = new_node
+
+                if new_node.value not in comb_freq_table:
+                    comb_freq_table[new_node.value] = 0
+                    comb_node_table[new_node.value] = []
+
+                comb_freq_table[new_node.value] += new_node.freq
+                comb_node_table[new_node.value].append(new_node)
+
+                comb_freq_table[node.next.value] -= node.next.freq
+                if comb_freq_table[node.next.value] <= 0:
+                    comb_freq_table.pop(node.next.value)
+                    comb_node_table.pop(node.next.value)
+
+        # Drop the combined value
+        comb_freq_table.pop(max_pair)
+        comb_node_table.pop(max_pair)
+
+    return vocab, merges
+
+
+# Tokenizer
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+
+def pretokenize(input_str: str):
+    return re.finditer(PAT, input_str)
