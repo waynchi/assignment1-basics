@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 from cs336_basics.pretokenization_example import find_chunk_boundaries
+import heapq
+from multiprocessing import Pool
 
 import numpy.typing as npt
 import torch
@@ -568,6 +570,32 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+def process_chunk(start, end, input_path, special_tokens):
+    freq_table = {}
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+        # Process chunk here.
+        chunks = [chunk]
+        for special_token in special_tokens:
+            new_chunks = []
+            for c in chunks:
+                new_chunks.extend(c.split(special_token))
+            chunks = new_chunks
+
+        for c in chunks:
+            matches = pretokenize(c)
+
+            # First generate all bytes -> count
+            for m in matches:
+                token_bytes = m.group().encode("utf-8")
+                if token_bytes not in freq_table:
+                    freq_table[token_bytes] = 0
+                freq_table[token_bytes] += 1
+
+        return freq_table
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -606,28 +634,21 @@ def run_train_bpe(
         )
         i = 0
 
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
-            # Process chunk here.
-            chunks = [chunk]
-            for special_token in special_tokens:
-                new_chunks = []
-                for c in chunks:
-                    new_chunks.extend(c.split(special_token))
-                chunks = new_chunks
+        jobs = []
+        with Pool(10) as p:
+            for start, end in zip(boundaries[:-1], boundaries[1:]):
+                jobs.append(
+                    p.apply_async(
+                        process_chunk, (start, end, input_path, special_tokens)
+                    )
+                )
 
-            for c in chunks:
-                matches = pretokenize(c)
+                i += 1
 
-                # First generate all bytes -> count
-                for m in matches:
-                    token_bytes = m.group().encode("utf-8")
-                    if token_bytes not in freq_table:
-                        freq_table[token_bytes] = 0
-                    freq_table[token_bytes] += 1
-
-            i += 1
+            for job in jobs:
+                chunk_freq_table = job.get()
+                for token, count in chunk_freq_table.items():
+                    freq_table[token] = freq_table.get(token, 0) + count
 
     vocab_list, merges = bpe(vocab, freq_table, vocab_size, **kwargs)
 
@@ -647,6 +668,11 @@ class Node:
     alive: bool = True
 
 
+class ReversePair(tuple):
+    def __lt__(self, other):
+        return tuple.__gt__(self, other)
+
+
 def bpe(
     vocab,
     freq_table,
@@ -660,6 +686,7 @@ def bpe(
     # Second generate all the combination counts
     comb_freq_table = {}
     comb_node_table = {}
+    comb_freq_heapq = []
 
     # construct linked list
     for word in freq_table.keys():
@@ -679,11 +706,25 @@ def bpe(
 
             prev = current
 
+    comb_freq_heapq = [
+        (-freq, ReversePair(pair)) for pair, freq in comb_freq_table.items()
+    ]
+    heapq.heapify(comb_freq_heapq)
+
     while len(vocab) < vocab_size and comb_freq_table:
-        comb_freq_table = dict(sorted(comb_freq_table.items(), reverse=True))
         # Third update the vocab
         # Get max of comb_freq_table
-        max_pair = max(comb_freq_table, key=comb_freq_table.get)
+        max_pair = None
+        while comb_freq_heapq:
+            new_freq, pair = heapq.heappop(comb_freq_heapq)
+            pair = tuple(pair)
+            if comb_freq_table.get(pair) == -new_freq:
+                max_pair = pair
+                break
+
+        if max_pair is None:
+            break
+
         combined = max_pair[0] + max_pair[1]
         vocab.append(combined)
         merges.append(max_pair)
@@ -710,11 +751,23 @@ def bpe(
 
                 comb_freq_table[new_node.value] += new_node.freq
                 comb_node_table[new_node.value].append(new_node)
+                heapq.heappush(
+                    comb_freq_heapq,
+                    (-comb_freq_table[new_node.value], ReversePair(new_node.value)),
+                )
 
                 comb_freq_table[node.prev.value] -= node.prev.freq
                 if comb_freq_table[node.prev.value] <= 0:
                     comb_freq_table.pop(node.prev.value)
                     comb_node_table.pop(node.prev.value)
+                else:
+                    heapq.heappush(
+                        comb_freq_heapq,
+                        (
+                            -comb_freq_table[node.prev.value],
+                            ReversePair(node.prev.value),
+                        ),
+                    )
 
             if node.next is not None:
                 node.next.alive = False
@@ -733,11 +786,23 @@ def bpe(
 
                 comb_freq_table[new_node.value] += new_node.freq
                 comb_node_table[new_node.value].append(new_node)
+                heapq.heappush(
+                    comb_freq_heapq,
+                    (-comb_freq_table[new_node.value], ReversePair(new_node.value)),
+                )
 
                 comb_freq_table[node.next.value] -= node.next.freq
                 if comb_freq_table[node.next.value] <= 0:
                     comb_freq_table.pop(node.next.value)
                     comb_node_table.pop(node.next.value)
+                else:
+                    heapq.heappush(
+                        comb_freq_heapq,
+                        (
+                            -comb_freq_table[node.next.value],
+                            ReversePair(node.next.value),
+                        ),
+                    )
 
         # Drop the combined value
         comb_freq_table.pop(max_pair)
